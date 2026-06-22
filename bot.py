@@ -217,62 +217,92 @@ class DnDBot(commands.Bot):
 
 bot = DnDBot()
 
-# ─── Availability Modal ────────────────────────────────────────────────────────
+# ─── Availability Button View ─────────────────────────────────────────────────
 
-class AvailabilityModal(discord.ui.Modal, title="📅 Set Your Availability"):
-    def __init__(self, week_start: date, locked: bool):
-        super().__init__()
-        self.week_start = week_start
-        self.locked = locked
-
-        label = f"Available days ({week_label(week_start)})"
-        placeholder = "e.g. Mon, Wed, Fri  OR  all  OR  none"
-        self.days_input = discord.ui.TextInput(
+class DayToggleButton(discord.ui.Button):
+    def __init__(self, day_index: int, day_date: date):
+        self.day_index = day_index
+        label = f"{DAYS_SHORT[day_index]}\n{day_date.strftime('%b %d')}"
+        super().__init__(
             label=label,
-            placeholder=placeholder,
-            style=discord.TextStyle.short,
-            required=True,
-            max_length=100,
+            style=discord.ButtonStyle.secondary,
+            row=0,
         )
-        self.add_item(self.days_input)
 
-    async def on_submit(self, interaction: discord.Interaction):
-        if self.locked:
-            await interaction.response.send_message(
-                "⛔ That week is locked and can no longer be edited.", ephemeral=True
-            )
+    async def callback(self, interaction: discord.Interaction):
+        view: AvailabilityView = self.view
+        if self.day_index in view.selected:
+            view.selected.discard(self.day_index)
+            self.style = discord.ButtonStyle.secondary
+        else:
+            view.selected.add(self.day_index)
+            self.style = discord.ButtonStyle.success
+        await interaction.response.edit_message(
+            content=view.build_prompt(), view=view
+        )
+
+
+class AvailabilityView(discord.ui.View):
+    def __init__(self, week_start: date, user: discord.Member, previously_selected: set[int]):
+        super().__init__(timeout=120)
+        self.week_start = week_start
+        self.user = user
+        self.selected: set[int] = set(previously_selected)
+
+        for i in range(7):
+            btn = DayToggleButton(i, date_of_day(week_start, i))
+            if i in self.selected:
+                btn.style = discord.ButtonStyle.success
+            self.add_item(btn)
+
+    def build_prompt(self) -> str:
+        header = f"📅 **{self.user.display_name}** — {week_label(self.week_start)}\n"
+        if self.selected:
+            days = ", ".join(DAYS[i] for i in sorted(self.selected))
+            header += f"Selected: **{days}**\n"
+        else:
+            header += "Selected: *none — click days to toggle them*\n"
+        header += "\nTap days to toggle availability, then confirm."
+        return header
+
+    @discord.ui.button(label="✅ Confirm", style=discord.ButtonStyle.primary, row=1)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user.id:
+            await interaction.response.send_message("This isn't your availability picker!", ephemeral=True)
             return
 
-        raw = self.days_input.value.strip().lower()
-        indices: list[int] = []
+        await save_availability(
+            interaction.guild_id,
+            self.user.id,
+            self.user.display_name,
+            self.week_start,
+            list(self.selected),
+        )
 
-        if raw in ("all", "every day", "everyday"):
-            indices = list(range(7))
-        elif raw in ("none", "nothing", "unavailable", "busy"):
-            indices = []
+        self.stop()
+        for child in self.children:
+            child.disabled = True
+
+        if self.selected:
+            day_names = ", ".join(DAYS[i] for i in sorted(self.selected))
+            msg = f"✅ **{self.user.display_name}**, saved for **{week_label(self.week_start)}**:\n> {day_names}"
         else:
-            for part in raw.replace(",", " ").split():
-                for i, (full, short) in enumerate(zip(
-                    [d.lower() for d in DAYS],
-                    [d.lower() for d in DAYS_SHORT]
-                )):
-                    if part == full or part == short or part == full[:3]:
-                        if i not in indices:
-                            indices.append(i)
-                        break
+            msg = f"✅ **{self.user.display_name}**, marked as **unavailable** for **{week_label(self.week_start)}**."
 
-        username = interaction.user.display_name
-        guild_id = interaction.guild_id
+        await interaction.response.edit_message(content=msg, view=self)
 
-        await save_availability(guild_id, interaction.user.id, username, self.week_start, indices)
+    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.danger, row=1)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user.id:
+            await interaction.response.send_message("This isn't your availability picker!", ephemeral=True)
+            return
+        self.stop()
+        await interaction.response.edit_message(content="❌ Cancelled — nothing was saved.", view=None)
 
-        if indices:
-            day_names = ", ".join(DAYS[i] for i in sorted(indices))
-            msg = f"✅ **{username}**, your availability for **{week_label(self.week_start)}** is saved:\n> {day_names}"
-        else:
-            msg = f"✅ **{username}**, you've been marked as **unavailable** for **{week_label(self.week_start)}**."
+    async def on_timeout(self):
+        # Silently expire — the ephemeral message just stops responding
+        self.stop()
 
-        await interaction.response.send_message(msg, ephemeral=True)
 
 # ─── Cog ───────────────────────────────────────────────────────────────────────
 
@@ -298,9 +328,26 @@ class SchedulerCog(commands.Cog):
         await ensure_guild(interaction.guild_id)
         offset = 0 if week == "current" else 1
         monday = get_week_start(offset)
-        locked = await is_locked(interaction.guild_id, monday)
-        modal = AvailabilityModal(monday, locked)
-        await interaction.response.send_modal(modal)
+
+        if await is_locked(interaction.guild_id, monday):
+            await interaction.response.send_message(
+                f"⛔ The week of **{week_label(monday)}** is locked and can no longer be edited.",
+                ephemeral=True,
+            )
+            return
+
+        # Pre-load any existing selection for this user
+        existing = await get_availability(interaction.guild_id, monday)
+        user_avail = existing.get(interaction.user.id, {})
+        previously_selected = {d for d, avail in user_avail.items() if avail}
+
+        view = AvailabilityView(monday, interaction.user, previously_selected)
+        await interaction.response.send_message(
+            content=view.build_prompt(),
+            view=view,
+            ephemeral=True,
+        )
+
 
     # ── /dates ─────────────────────────────────────────────────────────────────
 
