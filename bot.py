@@ -41,11 +41,17 @@ async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS guild_config (
-                guild_id    INTEGER PRIMARY KEY,
-                paused      INTEGER DEFAULT 0,
-                remind_channel INTEGER DEFAULT NULL
+                guild_id       INTEGER PRIMARY KEY,
+                paused         INTEGER DEFAULT 0,
+                remind_channel INTEGER DEFAULT NULL,
+                auto_lock      INTEGER DEFAULT 1
             )
         """)
+        # Migrate existing rows that predate the auto_lock column
+        try:
+            await db.execute("ALTER TABLE guild_config ADD COLUMN auto_lock INTEGER DEFAULT 1")
+        except Exception:
+            pass  # Column already exists
         await db.execute("""
             CREATE TABLE IF NOT EXISTS availability (
                 guild_id    INTEGER NOT NULL,
@@ -88,6 +94,14 @@ async def is_locked(guild_id: int, week_start: date) -> bool:
             (guild_id, week_start.isoformat()),
         ) as cur:
             return await cur.fetchone() is not None
+
+async def get_auto_lock(guild_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT auto_lock FROM guild_config WHERE guild_id = ?", (guild_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return bool(row[0]) if row else True
 
 async def get_remind_channel(guild_id: int) -> int | None:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -161,6 +175,14 @@ async def lock_week(guild_id: int, week_start: date):
         )
         await db.commit()
 
+async def unlock_week(guild_id: int, week_start: date):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM locked_weeks WHERE guild_id = ? AND week_start = ?",
+            (guild_id, week_start.isoformat()),
+        )
+        await db.commit()
+
 async def purge_old_weeks(guild_id: int):
     """Remove data older than 2 weeks ago."""
     cutoff = (get_week_start(-2)).isoformat()
@@ -179,7 +201,6 @@ async def purge_old_weeks(guild_id: int):
 
 intents = discord.Intents.default()
 intents.members = True
-intents.message_content = True
 
 class DnDBot(commands.Bot):
     def __init__(self):
@@ -441,6 +462,101 @@ class SchedulerCog(commands.Cog):
             f"**{week_label(next_monday)}** using `/availability`!"
         )
 
+    # ── /unlock-week ──────────────────────────────────────────────────────────
+
+    @app_commands.command(name="unlock-week", description="[Admin] Unlock a week so availability can be edited again.")
+    @app_commands.describe(week="Which week to unlock")
+    @app_commands.choices(week=[
+        app_commands.Choice(name="Current week (default)", value="current"),
+        app_commands.Choice(name="Next week", value="next"),
+    ])
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def unlock_week_cmd(self, interaction: discord.Interaction, week: str = "current"):
+        await ensure_guild(interaction.guild_id)
+        offset = 0 if week == "current" else 1
+        monday = get_week_start(offset)
+        await unlock_week(interaction.guild_id, monday)
+        await interaction.response.send_message(
+            f"🔓 Week of **{week_label(monday)}** is now unlocked. Availability can be edited again.",
+            ephemeral=True,
+        )
+
+    # ── /auto-lock-enable ─────────────────────────────────────────────────────
+
+    @app_commands.command(name="auto-lock-enable", description="[Admin] Enable automatic week locking on Monday.")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def auto_lock_enable(self, interaction: discord.Interaction):
+        await ensure_guild(interaction.guild_id)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE guild_config SET auto_lock = 1 WHERE guild_id = ?", (interaction.guild_id,)
+            )
+            await db.commit()
+        await interaction.response.send_message(
+            "🔒 Auto-lock enabled. Weeks will automatically lock every Monday at 00:00 UTC.",
+            ephemeral=True,
+        )
+
+    # ── /auto-lock-disable ────────────────────────────────────────────────────
+
+    @app_commands.command(name="auto-lock-disable", description="[Admin] Disable automatic week locking on Monday.")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def auto_lock_disable(self, interaction: discord.Interaction):
+        await ensure_guild(interaction.guild_id)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE guild_config SET auto_lock = 0 WHERE guild_id = ?", (interaction.guild_id,)
+            )
+            await db.commit()
+        await interaction.response.send_message(
+            "🔓 Auto-lock disabled. Weeks will stay open until you manually lock them with `/lock-week`.",
+            ephemeral=True,
+        )
+
+    # ── /settings ─────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="settings", description="Show current bot settings for this server.")
+    async def settings(self, interaction: discord.Interaction):
+        await ensure_guild(interaction.guild_id)
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT paused, remind_channel, auto_lock FROM guild_config WHERE guild_id = ?",
+                (interaction.guild_id,),
+            ) as cur:
+                row = await cur.fetchone()
+
+        paused, channel_id, auto_lock = row if row else (0, None, 1)
+
+        current_monday = get_week_start(0)
+        next_monday = get_week_start(1)
+        current_locked = await is_locked(interaction.guild_id, current_monday)
+        next_locked = await is_locked(interaction.guild_id, next_monday)
+
+        channel_str = f"<#{channel_id}>" if channel_id else "❌ Not set — use `/set-reminder-channel`"
+
+        embed = discord.Embed(
+            title="⚙️ Server Settings",
+            color=0xEB459E,
+        )
+        embed.add_field(
+            name="🔔 Reminders",
+            value=(
+                f"**Status:** {'⏸️ Paused' if paused else '▶️ Active'}\n"
+                f"**Channel:** {channel_str}"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🔒 Locking",
+            value=(
+                f"**Auto-lock:** {'✅ Enabled' if auto_lock else '❌ Disabled'}\n"
+                f"**Current week:** {'🔒 Locked' if current_locked else '🔓 Open'} ({week_label(current_monday)})\n"
+                f"**Next week:** {'🔒 Locked' if next_locked else '🔓 Open'} ({week_label(next_monday)})"
+            ),
+            inline=False,
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
     # ── /help ─────────────────────────────────────────────────────────────────
 
     @app_commands.command(name="help", description="Show all available bot commands.")
@@ -456,7 +572,7 @@ class SchedulerCog(commands.Cog):
                 "`/dates` — Show days where all respondents are free\n"
                 "`/overview` — Full availability grid for the week\n"
                 "`/status` — See who has and hasn't submitted yet\n"
-                "`/remind` — Ping everyone who hasn't submitted yet"
+                "`/remind` — Manually ping everyone who hasn't submitted yet"
             ),
             inline=False,
         )
@@ -467,7 +583,18 @@ class SchedulerCog(commands.Cog):
                 "`/pause` — Stop automatic weekend reminders\n"
                 "`/resume` — Resume automatic weekend reminders\n"
                 "`/lock-week` — Manually lock the current week\n"
+                "`/unlock-week` — Unlock a week so availability can be edited again\n"
+                "`/auto-lock-enable` — Automatically lock weeks every Monday\n"
+                "`/auto-lock-disable` — Disable automatic locking\n"
                 "`/admin-reset` — Clear all availability for a week"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="📋 Info",
+            value=(
+                "`/settings` — View current bot settings for this server\n"
+                "`/help` — Show this message"
             ),
             inline=False,
         )
@@ -475,7 +602,7 @@ class SchedulerCog(commands.Cog):
             name="🕐 Automatic behaviour",
             value=(
                 "• **Sat & Sun at 10:00 UTC** — reminds anyone who hasn't submitted\n"
-                "• **Monday at 00:00 UTC** — locks current week, opens next week, purges old data"
+                "• **Monday at 00:00 UTC** — locks current week (if auto-lock on), opens next week, purges old data"
             ),
             inline=False,
         )
@@ -616,12 +743,13 @@ class SchedulerCog(commands.Cog):
         current_monday = get_week_start(0)
 
         async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT guild_id, remind_channel FROM guild_config") as cur:
+            async with db.execute("SELECT guild_id, remind_channel, auto_lock FROM guild_config") as cur:
                 guilds = await cur.fetchall()
 
-        for guild_id, channel_id in guilds:
-            # Lock current week
-            await lock_week(guild_id, current_monday)
+        for guild_id, channel_id, auto_lock in guilds:
+            # Lock current week only if auto_lock is enabled
+            if auto_lock:
+                await lock_week(guild_id, current_monday)
             # Purge old data
             await purge_old_weeks(guild_id)
 
@@ -646,6 +774,9 @@ class SchedulerCog(commands.Cog):
     @resume.error
     @set_reminder_channel.error
     @lock_week_cmd.error
+    @unlock_week_cmd.error
+    @auto_lock_enable.error
+    @auto_lock_disable.error
     @admin_reset.error
     async def admin_error(self, interaction: discord.Interaction, error):
         if isinstance(error, app_commands.MissingPermissions):
