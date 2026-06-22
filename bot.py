@@ -237,9 +237,41 @@ class DayToggleButton(discord.ui.Button):
         else:
             view.selected.add(self.day_index)
             self.style = discord.ButtonStyle.success
+
+        # Sync All button
+        view.all_btn.style = discord.ButtonStyle.success if view.selected == set(range(7)) else discord.ButtonStyle.secondary
+
         await interaction.response.edit_message(
             content=view.build_prompt(), view=view
         )
+
+
+class AllToggleButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="All",
+            style=discord.ButtonStyle.secondary,
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view: AvailabilityView = self.view
+        all_selected = set(range(7)) == view.selected
+        if all_selected:
+            # All are on — turn everything off
+            view.selected.clear()
+            self.style = discord.ButtonStyle.secondary
+        else:
+            # Not all on — enable all
+            view.selected = set(range(7))
+            self.style = discord.ButtonStyle.success
+
+        # Sync all day button styles
+        for child in view.children:
+            if isinstance(child, DayToggleButton):
+                child.style = discord.ButtonStyle.success if child.day_index in view.selected else discord.ButtonStyle.secondary
+
+        await interaction.response.edit_message(content=view.build_prompt(), view=view)
 
 
 class AvailabilityView(discord.ui.View):
@@ -248,6 +280,7 @@ class AvailabilityView(discord.ui.View):
         self.week_start = week_start
         self.user = user
         self.selected: set[int] = set(previously_selected)
+        self.all_btn = AllToggleButton()
 
         for i in range(7):
             btn = DayToggleButton(i, date_of_day(week_start, i))
@@ -255,6 +288,11 @@ class AvailabilityView(discord.ui.View):
             if i in self.selected:
                 btn.style = discord.ButtonStyle.success
             self.add_item(btn)
+
+        # Sync All button initial style
+        if self.selected == set(range(7)):
+            self.all_btn.style = discord.ButtonStyle.success
+        self.add_item(self.all_btn)
 
     def build_prompt(self) -> str:
         header = f"📅 **{self.user.display_name}** — {week_label(self.week_start)}\n"
