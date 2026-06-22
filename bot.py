@@ -251,6 +251,7 @@ class AvailabilityView(discord.ui.View):
 
         for i in range(7):
             btn = DayToggleButton(i, date_of_day(week_start, i))
+            btn.row = 0 if i < 4 else 1  # Mon–Thu on row 0, Fri–Sun on row 1
             if i in self.selected:
                 btn.style = discord.ButtonStyle.success
             self.add_item(btn)
@@ -265,7 +266,7 @@ class AvailabilityView(discord.ui.View):
         header += "\nTap days to toggle availability, then confirm."
         return header
 
-    @discord.ui.button(label="✅ Confirm", style=discord.ButtonStyle.primary, row=1)
+    @discord.ui.button(label="✅ Confirm", style=discord.ButtonStyle.primary, row=2)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.user.id:
             await interaction.response.send_message("This isn't your availability picker!", ephemeral=True)
@@ -291,7 +292,7 @@ class AvailabilityView(discord.ui.View):
 
         await interaction.response.edit_message(content=msg, view=self)
 
-    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.danger, row=1)
+    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.danger, row=2)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.user.id:
             await interaction.response.send_message("This isn't your availability picker!", ephemeral=True)
