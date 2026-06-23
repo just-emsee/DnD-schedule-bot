@@ -209,6 +209,16 @@ class DnDBot(commands.Bot):
     async def setup_hook(self):
         await init_db()
         await self.add_cog(SchedulerCog(self))
+
+        # Sync slash commands to a specific guild (server) for faster updates during development.
+        try :
+            guild_id = id=os.getenv("DEV_GUILD_ID")
+            guild = discord.Object(guild_id)
+            bot.tree.copy_global_to(guild=guild)
+            await bot.tree.sync(guild=guild)
+            print(f"Synced to dev guild. (ID: {guild_id})")
+        except Exception : pass
+
         await self.tree.sync()
         print("Commands synced.")
 
