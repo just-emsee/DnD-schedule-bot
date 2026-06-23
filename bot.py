@@ -203,7 +203,7 @@ intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
 
-class DnDBot(commands.Bot(command_prefix="!", intents=intents)):
+class DnDBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents)
 
