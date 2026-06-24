@@ -231,6 +231,7 @@ async def purge_old_weeks(guild_id: int):
 
 intents = discord.Intents.default()
 intents.members = True
+intents.message_content = True
 
 class DnDBot(commands.Bot):
     def __init__(self):
