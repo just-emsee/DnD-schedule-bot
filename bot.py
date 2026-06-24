@@ -70,6 +70,13 @@ async def init_db():
                 PRIMARY KEY (guild_id, week_start)
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS excluded_users (
+                guild_id    INTEGER NOT NULL,
+                user_id     INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, user_id)
+            )
+        """)
         await db.commit()
 
 async def ensure_guild(guild_id: int):
@@ -183,6 +190,29 @@ async def unlock_week(guild_id: int, week_start: date):
         )
         await db.commit()
 
+async def get_excluded_users(guild_id: int) -> set[int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT user_id FROM excluded_users WHERE guild_id = ?", (guild_id,)
+        ) as cur:
+            return {row[0] async for row in cur}
+
+async def exclude_user(guild_id: int, user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO excluded_users (guild_id, user_id) VALUES (?, ?)",
+            (guild_id, user_id),
+        )
+        await db.commit()
+
+async def include_user(guild_id: int, user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM excluded_users WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        )
+        await db.commit()
+
 async def purge_old_weeks(guild_id: int):
     """Remove data older than 2 weeks ago."""
     cutoff = (get_week_start(-2)).isoformat()
@@ -201,7 +231,6 @@ async def purge_old_weeks(guild_id: int):
 
 intents = discord.Intents.default()
 intents.members = True
-intents.message_content = True
 
 class DnDBot(commands.Bot):
     def __init__(self):
@@ -321,6 +350,8 @@ class AvailabilityView(discord.ui.View):
             await interaction.response.send_message("This isn't your availability picker!", ephemeral=True)
             return
 
+        await interaction.response.defer(ephemeral=True)
+
         await save_availability(
             interaction.guild_id,
             self.user.id,
@@ -339,15 +370,16 @@ class AvailabilityView(discord.ui.View):
         else:
             msg = f"✅ **{self.user.display_name}**, marked as **unavailable** for **{week_label(self.week_start)}**."
 
-        await interaction.response.edit_message(content=msg, view=self)
+        await interaction.edit_original_response(content=msg, view=self)
 
     @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.danger, row=2)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.user.id:
             await interaction.response.send_message("This isn't your availability picker!", ephemeral=True)
             return
+        await interaction.response.defer(ephemeral=True)
         self.stop()
-        await interaction.response.edit_message(content="❌ Cancelled — nothing was saved.", view=None)
+        await interaction.edit_original_response(content="❌ Cancelled — nothing was saved.", view=None)
 
     async def on_timeout(self):
         # Silently expire — the ephemeral message just stops responding
@@ -515,7 +547,8 @@ class SchedulerCog(commands.Cog):
         monday = get_week_start(offset)
 
         submitted = await get_users_submitted(interaction.guild_id, monday)
-        members = [m for m in interaction.guild.members if not m.bot]
+        excluded = await get_excluded_users(interaction.guild_id)
+        members = [m for m in interaction.guild.members if not m.bot and m.id not in excluded]
 
         done = [m for m in members if m.id in submitted]
         pending = [m for m in members if m.id not in submitted]
@@ -544,7 +577,8 @@ class SchedulerCog(commands.Cog):
         next_monday = get_week_start(1)
 
         submitted = await get_users_submitted(interaction.guild_id, next_monday)
-        pending = [m for m in interaction.guild.members if not m.bot and m.id not in submitted]
+        excluded = await get_excluded_users(interaction.guild_id)
+        pending = [m for m in interaction.guild.members if not m.bot and m.id not in submitted and m.id not in excluded]
 
         if not pending:
             await interaction.response.send_message(
@@ -557,6 +591,52 @@ class SchedulerCog(commands.Cog):
         await interaction.response.send_message(
             f"📣 Hey {mentions}! Don't forget to submit your availability for "
             f"**{week_label(next_monday)}** using `/availability`!"
+        )
+
+    # ── /exclude ──────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="exclude", description="[Admin] Exclude a user from reminders and status tracking.")
+    @app_commands.describe(user="The user to exclude")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def exclude_cmd(self, interaction: discord.Interaction, user: discord.Member):
+        await ensure_guild(interaction.guild_id)
+        await exclude_user(interaction.guild_id, user.id)
+        await interaction.response.send_message(
+            f"✅ **{user.display_name}** has been excluded from reminders and status tracking.",
+            ephemeral=True,
+        )
+
+    # ── /include ──────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="include", description="[Admin] Re-include a previously excluded user.")
+    @app_commands.describe(user="The user to re-include")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def include_cmd(self, interaction: discord.Interaction, user: discord.Member):
+        await ensure_guild(interaction.guild_id)
+        await include_user(interaction.guild_id, user.id)
+        await interaction.response.send_message(
+            f"✅ **{user.display_name}** is now included in reminders and status tracking again.",
+            ephemeral=True,
+        )
+
+    # ── /excluded-list ────────────────────────────────────────────────────────
+
+    @app_commands.command(name="excluded-list", description="Show all users currently excluded from the scheduler.")
+    async def excluded_list(self, interaction: discord.Interaction):
+        await ensure_guild(interaction.guild_id)
+        excluded = await get_excluded_users(interaction.guild_id)
+        if not excluded:
+            await interaction.response.send_message(
+                "✅ No users are currently excluded.", ephemeral=True
+            )
+            return
+        names = []
+        for uid in excluded:
+            member = interaction.guild.get_member(uid)
+            names.append(member.display_name if member else f"Unknown user ({uid})")
+        await interaction.response.send_message(
+            "🚫 **Excluded users:**\n" + "\n".join(f"• {n}" for n in names),
+            ephemeral=True,
         )
 
     # ── /unlock-week ──────────────────────────────────────────────────────────
@@ -631,6 +711,16 @@ class SchedulerCog(commands.Cog):
 
         channel_str = f"<#{channel_id}>" if channel_id else "❌ Not set — use `/set-reminder-channel`"
 
+        excluded = await get_excluded_users(interaction.guild_id)
+        if excluded:
+            excluded_names = []
+            for uid in excluded:
+                member = interaction.guild.get_member(uid)
+                excluded_names.append(member.display_name if member else f"Unknown ({uid})")
+            excluded_str = "\n".join(f"• {n}" for n in excluded_names)
+        else:
+            excluded_str = "None"
+
         embed = discord.Embed(
             title="⚙️ Server Settings",
             color=0xEB459E,
@@ -650,6 +740,11 @@ class SchedulerCog(commands.Cog):
                 f"**Current week:** {'🔒 Locked' if current_locked else '🔓 Open'} ({week_label(current_monday)})\n"
                 f"**Next week:** {'🔒 Locked' if next_locked else '🔓 Open'} ({week_label(next_monday)})"
             ),
+            inline=False,
+        )
+        embed.add_field(
+            name=f"🚫 Excluded users ({len(excluded)})",
+            value=excluded_str,
             inline=False,
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -683,6 +778,8 @@ class SchedulerCog(commands.Cog):
                 "`/unlock-week` — Unlock a week so availability can be edited again\n"
                 "`/auto-lock-enable` — Automatically lock weeks every Monday\n"
                 "`/auto-lock-disable` — Disable automatic locking\n"
+                "`/exclude @user` — Exclude a user from reminders and status\n"
+                "`/include @user` — Re-include a previously excluded user\n"
                 "`/admin-reset` — Clear all availability for a week"
             ),
             inline=False,
@@ -690,6 +787,7 @@ class SchedulerCog(commands.Cog):
         embed.add_field(
             name="📋 Info",
             value=(
+                "`/excluded-list` — Show all excluded users\n"
                 "`/settings` — View current bot settings for this server\n"
                 "`/help` — Show this message"
             ),
@@ -810,7 +908,8 @@ class SchedulerCog(commands.Cog):
                 continue
 
             submitted = await get_users_submitted(guild_id, next_monday)
-            pending = [m for m in guild.members if not m.bot and m.id not in submitted]
+            excluded = await get_excluded_users(guild_id)
+            pending = [m for m in guild.members if not m.bot and m.id not in submitted and m.id not in excluded]
 
             if not pending:
                 await channel.send(
@@ -874,6 +973,8 @@ class SchedulerCog(commands.Cog):
     @unlock_week_cmd.error
     @auto_lock_enable.error
     @auto_lock_disable.error
+    @exclude_cmd.error
+    @include_cmd.error
     @admin_reset.error
     async def admin_error(self, interaction: discord.Interaction, error):
         if isinstance(error, app_commands.MissingPermissions):
